@@ -1,91 +1,143 @@
-# Nations pending-turn feed
+# Nations notification-service feed
 
-External notification services can use one read-only WebSocket instead of a
-connection and repeated full game-state requests for every watched match.
-The server knows nothing about subscriptions, Discord accounts, channels, or
-delivery preferences. Filtering and notification delivery belong to the client.
+One read-only WebSocket supplies registered usernames, unfinished-game metadata,
+and pending turn owners. External notification services can replace public
+webpage scraping and per-match sockets entirely. Subscriptions, Discord accounts,
+channels, deduplication and delivery preferences stay in the external service.
 
 ## Deployment
 
 Set `NATIONS_TURN_FEED_ENABLED=TRUE` in the ASGI process environment and restart
-the application. The endpoint is disabled by default. Use the existing shared
-Redis channel layer when running multiple ASGI processes; an in-memory layer
-only works within one process. No database migration is needed.
+the application. The endpoint is disabled by default. Multi-process production
+deployments require the existing shared Redis channel layer; the in-memory layer
+only works within one process. No new dependency or database migration is needed.
 
-Connect to `wss://games.tabony.net/ws/nations/turns/`. This is an anonymous public
-feed of game IDs and usernames already visible in public game listings, not a
-player-authenticated or Discord-specific endpoint. The operator should enable
-it only if publishing this aggregate public feed is acceptable.
+Connect to `wss://games.tabony.net/ws/nations/turns/`. This anonymous endpoint
+publishes game metadata and an aggregate registered-username directory, including
+accounts with no ongoing games. The operator must opt in to publishing this
+directory. Only account IDs and exact usernames are exposed: no email addresses,
+real names, passwords, sessions, notes, chats or notification settings.
 
-## Protocol
+## Initial snapshot
 
-The server immediately sends a complete snapshot of all started, unfinished
-games with a pending player, including ongoing archived games:
-
-```json
-{"type":"snapshot","turns":[{"game":"3038","player":"Kayser"}]}
-```
-
-Replace the client's pending-turn map with this snapshot. IDs are strings and
-usernames preserve their exact case. Match titles and participant lists are not
-included; clients can keep their existing public metadata cache if needed.
-
-After a committed turn-owner change or game completion/deletion:
+The server immediately sends all registered usernames except the internal
+`deleted_player` placeholder and all unfinished games. There is no seven-day
+cutoff: archived ongoing games and waiting games are included.
 
 ```json
-{"type":"turn","game":"3038","player":"Suddoman"}
-{"type":"turn","game":"3038","player":null}
+{
+  "type": "snapshot",
+  "players": [{"id": "17", "name": "Kayser"}],
+  "games": [{
+    "game": "3038",
+    "title": "S11-1A-P2",
+    "players": ["Kayser", "Suddoman"],
+    "invited": [],
+    "player_count": 2,
+    "started": true,
+    "player": "Kayser"
+  }]
+}
 ```
 
-Set the game's pending player, or remove it on `null`. Repeated messages are
-possible and must be treated as idempotent state updates, not unconditional
-notification commands. Moves that keep the same player do not broadcast.
-Starting a game also generates an update.
+Replace both client caches with the snapshot. All IDs are strings; usernames
+retain case. `players` on a game contains its recorded participants, including
+invitations, in existing player order. `invited` lists unaccepted invitations.
+`player_count` is the game's capacity. `started` indicates a nonempty saved replay;
+`player` is the pending owner, or `null` for a waiting game or deleted-player
+placeholder. Do not issue turn reminders for unstarted games.
 
-Send JSON `null` periodically (for example every 30 seconds):
+The player directory supplies typeahead even before an account joins a game.
+Stable account IDs let the client replace names reliably after a rename.
+
+## Incremental events
+
+Registrations and account renames upsert a player by ID. Deletions remove it:
 
 ```json
-{"type":"pong"}
+{"type":"player","id":"18","name":"NewPlayer"}
+{"type":"player","id":"18","name":null}
 ```
 
-The reply proves liveness and renews channel-layer group membership without a
-database scan or engine replay. Other incoming JSON closes the connection with
-code 1008; the endpoint accepts no moves, chat, settings, or subscriptions.
+Game creation, joins/invitation acceptance, title/capacity changes, game start and
+pending-player changes send the latest complete game record:
 
-Reconnect with bounded backoff after disconnects or missed heartbeat replies.
-Each connection receives a fresh snapshot. There is no durable event log:
-updates during downtime are recovered as current pending turns, not historical
-turns. Channels delivery is best-effort; a periodic reconnect can reconcile a
-rare dropped broadcast. The feed exposes current state rather than every
-intermediate turn if a game advances faster than the consumer processes events.
+```json
+{
+  "type": "game",
+  "game": "3038",
+  "details": {
+    "game": "3038", "title": "S11-1A-P2",
+    "players": ["Kayser", "Suddoman"], "invited": [],
+    "player_count": 2, "started": true, "player": "Suddoman"
+  }
+}
+```
 
-## Cost and integration
+Upsert the game by ID. Finishing or deleting a game removes it:
 
-Each connection does one joined database query for its initial snapshot. Each
-saved Match adds one small query for the previous player/game-over fields when
-the feed is enabled. Changes send a small marker through the existing channel
-layer; each feed connection reads the current stored player once per marker.
-Reading the latest owner also prevents an event queued before the initial
-snapshot from restoring an obsolete player. No rules-engine reconstruction,
-chat log, notes, or full game state is sent. Disabled mode adds no save query.
+```json
+{"type":"game","game":"3038","details":null}
+```
 
-Signals cover normal `Match.save()` and deletion, including admin saves.
-Bulk `QuerySet.update()` and raw SQL bypass save signals; code using them to
-change turn ownership must explicitly call `publish_turn_change(game_id)`
-after the update, within the same transaction. Failed publication is logged
-and never raises into a successfully saved game move.
+Account renames/deletions also refresh affected unfinished games so participant
+names and pending owners remain accurate. Declined invitations and administrative
+participant cleanup are reflected. This adds no leave-game operation: an accepted
+player cannot use the feed to leave, join or otherwise modify a game.
 
-This PR provides the server feed only. The external notifier must separately
-switch from per-match sockets to this protocol and retain its own deduplication,
-subscription storage, metadata discovery, Discord delivery and retry logic.
+Messages are idempotent state updates, not unconditional notification commands.
+Compare pending players against the previous cache before deciding whether to
+notify. Metadata updates and duplicate events must not repeat a turn reminder.
+Ordinary choices that keep the same owner, score updates, and login/preference
+updates do not broadcast game or player events.
 
-## Tests
+## Liveness and recovery
 
-With the repository's `requirements.txt` installed:
+Send JSON `null` periodically, for example every 30 seconds. The response is
+`{"type":"pong"}`. This proves liveness and renews channel-layer group membership
+without database queries or engine replay. Other incoming JSON closes the
+connection with code 1008. There are no feed commands for moves, chat, subscriptions
+or Discord settings.
+
+Reconnect with bounded backoff after disconnects or missing pong replies. Each
+connection gets a fresh authoritative snapshot. Channel delivery is best-effort,
+not a durable event log; periodically reconnect to reconcile rare dropped events
+without scraping. Downtime recovers current pending turns, not historical turns.
+Rapid changes can collapse to the latest state. Event handlers read current
+committed data so an older queued marker cannot restore stale snapshot values.
+
+## Server cost and persistence hooks
+
+The initial snapshot uses three queries: registered usernames, unfinished-game
+headers, and all their participant records. No replay text or rules engine is
+loaded. A game update uses at most two batched metadata queries per connected
+service; an account update uses one username query. Heartbeats perform no query.
+
+Enabled Match saves add one small comparison query for turn and metadata fields.
+Enabled participant saves compare only identity/invitation fields; routine
+score/nation saves explicitly limit their updated fields and skip feed queries.
+Account username changes refresh related games. Disabled mode adds no save query.
+
+Normal model saves/deletions publish through Django signals after transaction
+commit. Failed publication is logged and does not fail a saved game move. Bulk
+`QuerySet.update()`, `bulk_create()` and raw SQL bypass save signals; code using
+them to change relevant fields must call `publish_turn_change(game_id)` or
+`publish_player_change(player_id)` in the same transaction. A bulk username change
+also needs game updates for affected games. No subscription tables are added.
+
+## Client migration and validation
+
+This PR supplies the server protocol only. Switch the external notifier after
+deployment: use snapshot/event caches for typeahead, game discovery, titles,
+participants, `/status`, turn detection and game cleanup. Remove its recurring
+webpage scans and per-match socket refreshes. Keep its own stored subscriptions,
+delivery preferences, pending-turn deduplication and Discord retry queue.
+
+Run the isolated SQLite/in-memory-channel tests with the pinned dependencies:
 
 ```sh
 python -m django test Nations --settings=Nations.test_settings
 ```
 
-The isolated settings use SQLite and the in-memory channel layer, without
-production secrets, a running server, Redis, or the rules engine.
+No production secrets, Redis server, images or rules-engine checkout is required
+for these tests. Production Redis/DreamHost deployment is not covered.

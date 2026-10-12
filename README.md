@@ -7,8 +7,9 @@ This repo is deployed at https://games.tabony.net
 
 ## External turn notifications
 
-An optional [pending-turn WebSocket feed](docs/nations-turn-feed.md) lets external
-notification services observe all Nations games through one read-only connection.
+An optional [Nations WebSocket feed](docs/nations-turn-feed.md) gives external
+notification services registered usernames, ongoing game metadata and pending
+turns through one read-only connection, replacing public webpage scraping.
 Enable it with `NATIONS_TURN_FEED_ENABLED=TRUE`; it stores no notification subscriptions.
 
 ## Steps to run locally
