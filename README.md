@@ -5,6 +5,12 @@ Website for the game(s) implemented by Charles J. Tabony (Logitude)
 
 This repo is deployed at https://games.tabony.net
 
+## External turn notifications
+
+An optional [pending-turn WebSocket feed](docs/nations-turn-feed.md) lets external
+notification services observe all Nations games through one read-only connection.
+Enable it with `NATIONS_TURN_FEED_ENABLED=TRUE`; it stores no notification subscriptions.
+
 ## Steps to run locally
 
 1. This repo requires the nations repo: https://github.com/Logitude/nations to be either cloned into or linked into `Nations/nations`.
